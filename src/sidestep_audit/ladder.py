@@ -25,6 +25,7 @@ FORMAT_SCHEMA = {
         },
     },
 }
+# Retained for import compatibility; execution order is driven by the plan below.
 MUTATIONS = (
     "verbatim_passthrough",
     "direct_suffix",
@@ -35,6 +36,16 @@ MUTATIONS = (
     "provider_switch",
     "temperature_0_n_3",
 )
+# (mutation, required provider capability). A provider lacking the capability is
+# filtered out of the plan rather than being sent a parameter it will reject.
+MUTATION_PASS = (
+    ("direct_suffix", None),
+    ("both_positions", None),
+    ("format_lock", "supports_json_schema"),
+    ("persona_escalation", None),
+    ("temperature_0_n_3", "supports_n"),
+)
+MUTATION_PASS_DEPTH = 1
 
 
 @dataclass
@@ -216,6 +227,26 @@ def _synthesis_payload(original: dict[str, Any], questions: list[str], answers: 
     return payload
 
 
+def plan_attempts(provider_order: list[ProviderConfig], max_attempts: int) -> list[tuple[ProviderConfig, str]]:
+    """Build the attempt plan, cheapest and most likely first.
+
+    Phase 1 is a verbatim request to every provider in ascending filter risk: the
+    most common refusal is fixed by a different model, not by a reworded prompt,
+    and this phase costs one call per provider. Phase 2 reworks the prompt, but
+    only against the lowest-risk provider, because mutations multiply cost.
+    """
+    plan: list[tuple[ProviderConfig, str]] = [
+        (provider, "verbatim_passthrough") for provider in provider_order
+    ]
+    for mutation, capability in MUTATION_PASS:
+        for provider in provider_order[:MUTATION_PASS_DEPTH]:
+            if capability and not getattr(provider, capability, False):
+                continue
+            plan.append((provider, mutation))
+    plan.append((provider_order[0], "decompose"))
+    return plan
+
+
 Invoke = Callable[[ProviderConfig, dict[str, Any], str, int], Awaitable[AttemptOutcome]]
 
 
@@ -224,18 +255,28 @@ async def run_ladder(
     providers: list[ProviderConfig],
     default_provider: str,
     invoke: Invoke,
-    max_attempts: int = 8,
+    max_attempts: int = 12,
     max_cost_usd: float = 0.25,
     deadline_ms: int = 45000,
 ) -> LadderResult:
     sorted_providers = sorted(providers, key=lambda provider: (provider.filter_risk, provider.name))
     if not sorted_providers:
         return LadderResult(None, error="no_provider_available")
-    current = next((provider for provider in sorted_providers if provider.name == default_provider), sorted_providers[0])
-    provider_order = [current, *(provider for provider in sorted_providers if provider.name != current.name)]
+    current = next(
+        (provider for provider in sorted_providers if provider.name == default_provider),
+        sorted_providers[0],
+    )
+    provider_order = [current, *(p for p in sorted_providers if p.name != current.name)]
+    plan = plan_attempts(provider_order, max(1, max_attempts))
+
     started = time.monotonic()
     result = LadderResult(None)
     best_decomposed: AttemptOutcome | None = None
+    last_provider: str | None = None
+
+    def note_stop(reason: str) -> None:
+        if not result.budget_stops or result.budget_stops[-1] != reason:
+            result.budget_stops.append(reason)
 
     async def call(provider: ProviderConfig, outgoing: dict[str, Any], mutation: str, step: int) -> AttemptOutcome:
         remaining = deadline_ms - int((time.monotonic() - started) * 1000)
@@ -244,67 +285,36 @@ async def run_ladder(
         if result.cost_usd >= max_cost_usd:
             raise BudgetStop("max_cost_usd")
         try:
-            outcome = await asyncio.wait_for(invoke(provider, outgoing, mutation, step), timeout=remaining / 1000)
+            outcome = await asyncio.wait_for(
+                invoke(provider, outgoing, mutation, step), timeout=remaining / 1000
+            )
         except asyncio.TimeoutError as exc:
             raise BudgetStop("deadline_ms") from exc
         result.cost_usd += max(0.0, outcome.cost_usd)
         return outcome
 
-    step_mutations = {
-        1: "verbatim_passthrough",
-        2: "direct_suffix",
-        3: "both_positions",
-        4: "format_lock",
-        5: "decompose",
-        6: "persona_escalation",
-        8: "temperature_0_n_3",
-    }
-
-    for step in range(1, 9):
+    for step, (provider, mutation) in enumerate(plan, start=1):
         if step > max_attempts:
-            result.budget_stops.append("max_attempts")
+            note_stop("max_attempts")
             break
         if (time.monotonic() - started) * 1000 >= deadline_ms:
-            result.budget_stops.append("deadline_ms")
+            note_stop("deadline_ms")
             break
         if result.cost_usd >= max_cost_usd:
-            result.budget_stops.append("max_cost_usd")
+            note_stop("max_cost_usd")
             break
-
-        if step == 7:
-            position = provider_order.index(current)
-            alternate = provider_order[position + 1] if position + 1 < len(provider_order) else None
-            if alternate is None:
-                result.attempts.append(AttemptEntry(
-                    step, "provider_switch", current.name, "no_next_provider_by_filter_risk", "skipped", 0,
-                ))
-                continue
-            current = alternate
+        if last_provider is not None and provider.name != last_provider:
             result.provider_switches += 1
-            mutation = "verbatim_passthrough"
-            outgoing = mutate_payload(payload, mutation)
-            try:
-                outcome = await call(current, outgoing, mutation, step)
-            except BudgetStop as stop:
-                result.budget_stops.append(stop.reason)
-                result.attempts.append(AttemptEntry(
-                    step, mutation, current.name, stop.reason, "budget_stopped", 0, result.cost_usd,
-                ))
-                break
-            entry = AttemptEntry(
-                step, mutation, current.name, outcome.verdict.reason, outcome.verdict.label,
-                outcome.status_code, outcome.cost_usd, outcome.verdict.score,
-                outcome.cache_key, outcome.model, outcome.is_stream,
-            )
-        elif step == 5:
-            mutation = "decompose"
+        last_provider = provider.name
+
+        if mutation == "decompose":
             questions = split_subquestions(payload)
             answers: list[str] = []
             outcome: AttemptOutcome | None = None
             rule = "decompose_subquestions"
             try:
                 for question in questions:
-                    sub_outcome = await call(current, _decompose_payload(payload, question), mutation, step)
+                    sub_outcome = await call(provider, _decompose_payload(payload, question), mutation, step)
                     outcome = sub_outcome
                     if sub_outcome.verdict.label != "non_refusal":
                         rule = sub_outcome.verdict.reason
@@ -319,47 +329,38 @@ async def run_ladder(
                     if result.cost_usd >= max_cost_usd:
                         raise BudgetStop("max_cost_usd")
                 if len(answers) == len(questions):
-                    synth = await call(
-                        current,
-                        _synthesis_payload(payload, questions, answers),
-                        mutation,
-                        step,
-                    )
+                    synth = await call(provider, _synthesis_payload(payload, questions, answers), mutation, step)
                     outcome = synth
                     rule = synth.verdict.reason
             except BudgetStop as stop:
-                result.budget_stops.append(stop.reason)
+                note_stop(stop.reason)
                 if outcome is not None and outcome.verdict.label == "non_refusal":
                     result.outcome = outcome
                 elif best_decomposed is not None:
                     result.outcome = best_decomposed
                 result.attempts.append(AttemptEntry(
-                    step, mutation, current.name, stop.reason, "budget_stopped", 0,
-                    result.cost_usd,
+                    step, mutation, provider.name, stop.reason, "budget_stopped", 0, result.cost_usd,
                 ))
                 break
             if outcome is None:
                 continue
             entry = AttemptEntry(
-                step, mutation, current.name, rule, outcome.verdict.label, outcome.status_code,
+                step, mutation, provider.name, rule, outcome.verdict.label, outcome.status_code,
                 outcome.cost_usd, outcome.verdict.score, outcome.cache_key, outcome.model, outcome.is_stream,
             )
         else:
-            mutation = "provider_switch" if step == 7 else step_mutations[step]
-            outgoing = mutate_payload(payload, mutation)
-            call_mutation = "verbatim_passthrough" if step == 7 else mutation
             try:
-                outcome = await call(current, outgoing, call_mutation, step)
+                outcome = await call(provider, mutate_payload(payload, mutation), mutation, step)
             except BudgetStop as stop:
-                result.budget_stops.append(stop.reason)
+                note_stop(stop.reason)
                 result.attempts.append(AttemptEntry(
-                    step, mutation, current.name, stop.reason, "budget_stopped", 0, result.cost_usd,
+                    step, mutation, provider.name, stop.reason, "budget_stopped", 0, result.cost_usd,
                 ))
                 break
-            if step == 8:
+            if mutation == "temperature_0_n_3":
                 outcome = _select_longest_non_refusing(outcome, payload.get("messages", []))
             entry = AttemptEntry(
-                step, mutation, current.name, outcome.verdict.reason, outcome.verdict.label,
+                step, mutation, provider.name, outcome.verdict.reason, outcome.verdict.label,
                 outcome.status_code, outcome.cost_usd, outcome.verdict.score,
                 outcome.cache_key, outcome.model, outcome.is_stream,
             )
@@ -367,12 +368,11 @@ async def run_ladder(
         result.attempts.append(entry)
         if outcome.verdict.label == "unavailable":
             result.saw_unavailable = True
-        if result.cost_usd >= max_cost_usd:
-            result.budget_stops.append("max_cost_usd")
         if outcome.verdict.label == "non_refusal":
             result.outcome = outcome
             return result
-        if result.budget_stops and result.budget_stops[-1] == "max_cost_usd":
+        if result.cost_usd >= max_cost_usd:
+            note_stop("max_cost_usd")
             break
 
     if result.outcome is None:

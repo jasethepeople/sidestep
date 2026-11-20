@@ -432,6 +432,8 @@ def _available_providers(runtime: Settings) -> list[ProviderConfig]:
     providers = sorted(_provider_registry(runtime), key=lambda provider: (provider.filter_risk, provider.name))
     available: list[ProviderConfig] = []
     for provider in providers:
+        if not provider.enabled:
+            continue
         if provider.key_env and not os.getenv(provider.key_env, ""):
             logger.warning("provider_skipped_missing_key", provider=provider.name, key_env=provider.key_env)
             continue
@@ -475,6 +477,7 @@ async def _ladder_completion(request: Request, payload: dict[str, Any]) -> Respo
         upstream_key = os.getenv(provider.key_env, "") if provider.key_env else ""
         if upstream_key:
             headers["authorization"] = f"Bearer {upstream_key}"
+        headers.update(provider.extra_headers or {})
         request_body = json.dumps(call_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         upstream_request = request.app.state.client.build_request(
             "POST", url, content=request_body, headers=headers,

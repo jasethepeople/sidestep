@@ -5,13 +5,20 @@ from dataclasses import dataclass
 from typing import Any
 
 THRESHOLD = 0.55
-FILTER_MARKERS = ("content_filter", "content filter", "safety filter", "blocked by policy", "policy_violation")
+PREFIX_MAX_WORDS = 120
+PHRASE_MAX_WORDS = 60
+FILTER_MARKERS = (
+    "content_filter", "content filter", "safety filter", "blocked by policy", "policy_violation",
+)
 REFUSAL_PATTERNS = (
     re.compile(r"\b(i (?:can't|cannot|won't|will not) (?:help|assist|provide|comply))\b", re.I),
     re.compile(r"\b(i am unable to|i'm unable to|i cannot assist)\b", re.I),
     re.compile(r"\b(that request (?:is|would be) not something i can)\b", re.I),
+    re.compile(r"\b(beyond (?:my|the) (?:training|knowledge) (?:cutoff|window))\b", re.I),
 )
-PREFIX_REFUSAL = re.compile(r"^\s*(?:sorry[,! ]|i (?:can't|cannot|won't|am unable)|as an ai\b)", re.I)
+PREFIX_REFUSAL = re.compile(
+    r"^\s*(?:sorry[,! ]|unfortunately[,! ]|i (?:can't|cannot|won't|am unable)|as an ai\b)", re.I
+)
 HEDGING = re.compile(r"\b(i may be wrong|i'm not certain|i cannot verify|this may be incomplete)\b", re.I)
 
 
@@ -45,7 +52,10 @@ def _flatten(value: Any) -> str:
 
 def _request_text(value: Any) -> str:
     if isinstance(value, list):
-        return " ".join(_flatten(item.get("content", "")) if isinstance(item, dict) else _flatten(item) for item in value)
+        return " ".join(
+            _flatten(item.get("content", "")) if isinstance(item, dict) else _flatten(item)
+            for item in value
+        )
     return _flatten(value)
 
 
@@ -65,16 +75,30 @@ def _completion_text(payload: Any) -> str:
 
 
 def detect_verdict(payload: Any, status_code: int = 200, request_prompt: Any = None) -> Verdict:
+    """Classify one upstream response.
+
+    Transport failures never resolve to ``non_refusal``: a 400, 401 or 429 that is
+    passed through as an answer would silently stop the recovery ladder.
+    """
     if status_code >= 500:
         return Verdict("unavailable", 0.0, "upstream_server_error")
 
-    signals: list[tuple[float, str]] = []
     serialized = _flatten(payload)
     lowered = serialized.casefold()
-    choices = payload.get("choices") if isinstance(payload, dict) else None
 
-    if status_code in (400, 403) and any(marker in lowered for marker in FILTER_MARKERS):
-        signals.append((1.0, "http_content_filter"))
+    if status_code >= 400:
+        if any(marker in lowered for marker in FILTER_MARKERS):
+            return Verdict("refusal", 1.0, "http_content_filter")
+        if status_code == 429:
+            return Verdict("unavailable", 0.0, "rate_limited")
+        return Verdict("unavailable", 0.0, f"http_{status_code}")
+
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if isinstance(payload, dict) and payload.get("error") and not isinstance(choices, list):
+        return Verdict("unavailable", 0.0, "error_body_without_choices")
+
+    signals: list[tuple[float, str]] = []
+
     if isinstance(choices, list) and not choices:
         signals.append((1.0, "empty_choices"))
     if isinstance(choices, list):
@@ -84,20 +108,31 @@ def detect_verdict(payload: Any, status_code: int = 200, request_prompt: Any = N
             if choice.get("finish_reason") == "content_filter":
                 signals.append((1.0, "finish_reason_content_filter"))
             message = choice.get("message") or choice.get("delta") or {}
-            if isinstance(message, dict) and message.get("content") == "" and not message.get("tool_calls"):
+            if not isinstance(message, dict):
+                continue
+            if message.get("refusal"):
+                signals.append((1.0, "refusal_field"))
+            empty_content = message.get("content") == ""
+            if (
+                empty_content
+                and not message.get("tool_calls")
+                and not message.get("reasoning_content")
+            ):
                 signals.append((1.0, "empty_completion_content"))
 
     text = _completion_text(payload)
-    if PREFIX_REFUSAL.search(text):
+    response_words = len(text.split())
+
+    # Soft signals are length-gated: a 900-word answer that opens with "I can't
+    # provide exact figures, but..." is not a refusal.
+    if PREFIX_REFUSAL.search(text) and response_words <= PREFIX_MAX_WORDS:
         signals.append((0.88, "refusal_prefix"))
-    if any(pattern.search(text) for pattern in REFUSAL_PATTERNS):
+    if response_words <= PHRASE_MAX_WORDS and any(pattern.search(text) for pattern in REFUSAL_PATTERNS):
         signals.append((0.82, "refusal_phrase"))
-    if HEDGING.search(text):
+    if HEDGING.search(text) and response_words <= PHRASE_MAX_WORDS:
         signals.append((0.58, "hedging_language"))
 
-    prompt_text = _request_text(request_prompt)
-    request_words = len(prompt_text.split())
-    response_words = len(text.split())
+    request_words = len(_request_text(request_prompt).split())
     if request_words >= 100 and response_words < 20:
         signals.append((0.56, "very_short_response_to_complex_request"))
 

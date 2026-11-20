@@ -15,6 +15,10 @@ class ProviderConfig(BaseModel):
     filter_risk: int = Field(default=50, ge=0, le=100)
     price_usd_per_1m_tokens_in: float = Field(default=0.0, ge=0)
     price_usd_per_1m_tokens_out: float = Field(default=0.0, ge=0)
+    enabled: bool = True
+    supports_json_schema: bool = False
+    supports_n: bool = True
+    extra_headers: dict[str, str] = {}
 
 
 class Settings(BaseSettings):
@@ -29,7 +33,7 @@ class Settings(BaseSettings):
     providers: list[ProviderConfig] = Field(default_factory=list)
     default_provider: str = ""
     observe_only: bool | None = None
-    max_attempts: int = 8
+    max_attempts: int = 12
     max_cost_usd: float = 0.25
     deadline_ms: int = 45000
 
@@ -77,7 +81,7 @@ def load_settings() -> Settings:
         providers=providers,
         default_provider=default_provider,
         observe_only=observe_only,
-        max_attempts=max(1, min(8, configured.max_attempts)),
+        max_attempts=max(1, min(16, configured.max_attempts)),
         max_cost_usd=max(0.0, configured.max_cost_usd),
         deadline_ms=max(1, configured.deadline_ms),
     )
