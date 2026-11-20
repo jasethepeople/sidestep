@@ -1,0 +1,39 @@
+services:
+  mock-upstream:
+    build: .
+    command: ["uvicorn", "sidestep_audit.mock_provider:app", "--host", "0.0.0.0", "--port", "4100"]
+    environment:
+      MOCK_UPSTREAM_KEY: ${MOCK_UPSTREAM_KEY:-local-mock-key}
+      MOCK_SECONDARY_KEY: ${MOCK_SECONDARY_KEY:-local-secondary-key}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4100/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  sidestep:
+    build: .
+    ports:
+      - "127.0.0.1:4001:4001"
+    env_file:
+      - .env
+    environment:
+      SIDESTEP_TOKEN: ${SIDESTEP_TOKEN:-change-me-before-use}
+      SIDESTEP_OBSERVE_ONLY: ${SIDESTEP_OBSERVE_ONLY:-0}
+      MOCK_UPSTREAM_KEY: ${MOCK_UPSTREAM_KEY:-local-mock-key}
+      MOCK_SECONDARY_KEY: ${MOCK_SECONDARY_KEY:-local-secondary-key}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - sidestep-data:/data
+    depends_on:
+      mock-upstream:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4001/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  sidestep-data:

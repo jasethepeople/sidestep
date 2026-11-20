@@ -1,0 +1,66 @@
+gateway:
+  host: 0.0.0.0
+  port: 4001
+  database_path: /data/sidestep.sqlite3
+  request_timeout_seconds: 45
+  observe_only: false
+
+default_provider: mock-primary
+
+providers:
+  - name: mock-primary
+    base_url: http://mock-upstream:4100/v1
+    key_env: MOCK_UPSTREAM_KEY
+    model_alias: mock-model
+    filter_risk: 0
+    price_usd_per_1m_tokens_in: 0
+    price_usd_per_1m_tokens_out: 0
+  - name: mock-secondary
+    base_url: http://mock-upstream:4100/v1
+    key_env: MOCK_SECONDARY_KEY
+    model_alias: mock-model
+    filter_risk: 1
+    price_usd_per_1m_tokens_in: 0
+    price_usd_per_1m_tokens_out: 0
+  - name: ollama
+    base_url: http://host.docker.internal:11434/v1
+    key_env: OLLAMA_API_KEY
+    model_alias: llama3.2
+    filter_risk: 5
+    price_usd_per_1m_tokens_in: 0
+    price_usd_per_1m_tokens_out: 0
+  - name: venice
+    base_url: https://api.venice.ai/api/v1
+    key_env: VENICE_API_KEY
+    model_alias: llama-3.3-70b
+    filter_risk: 5
+    price_usd_per_1m_tokens_in: 0
+    price_usd_per_1m_tokens_out: 0
+  - name: free-llm
+    base_url: http://127.0.0.1:4000/v1
+    key_env: FREE_LLM_ROUTER_KEY
+    model_alias: auto
+    filter_risk: 20
+    price_usd_per_1m_tokens_in: 0
+    price_usd_per_1m_tokens_out: 0
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    key_env: OPENROUTER_API_KEY
+    model_alias: meta-llama/llama-3.3-70b-instruct
+    filter_risk: 30
+    price_usd_per_1m_tokens_in: 0
+    price_usd_per_1m_tokens_out: 0
+  - name: openai
+    base_url: https://api.openai.com/v1
+    key_env: OPENAI_API_KEY
+    model_alias: gpt-4.1-mini
+    filter_risk: 60
+    price_usd_per_1m_tokens_in: 0
+    price_usd_per_1m_tokens_out: 0
+  - name: anthropic
+    base_url: https://api.anthropic.com/v1
+    key_env: ANTHROPIC_API_KEY
+    model_alias: claude-3-5-haiku-latest
+    filter_risk: 65
+    price_usd_per_1m_tokens_in: 0
+    price_usd_per_1m_tokens_out: 0
